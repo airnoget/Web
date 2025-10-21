@@ -1,0 +1,27 @@
+## NOTE: This project depends on some packages that require newer Python versions
+## (>=3.8/3.9/3.10) and some that are best installed from conda-forge (e.g. kimimaro,
+## cloud-volume, itk, connected-components-3d). If you are on Windows it's strongly
+## recommended to create a conda environment and install the heavy packages via
+## conda-forge (see README). Example conda commands are provided in README.md.
+
+# Minimal pip-installable requirements (for a modern Python >=3.8/3.9/3.10)
+streamlit
+numpy
+scipy
+scikit-image
+nibabel
+matplotlib
+opencv-python
+xlrd2
+xlwt
+tqdm
+SimpleITK
+connected-components-3d
+imageio
+Pillow
+
+# Optional / better installed via conda-forge:
+# kimimaro
+# cloud-volume
+# itk
+# (install above with `conda install -c conda-forge kimimaro cloud-volume itk`)
