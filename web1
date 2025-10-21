@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import tempfile
+import shutil
+import traceback
+import time
+
+import json
+import streamlit as st
+import nibabel as nib
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.express as px
+
+import matplotlib
+
+# reuse project modules
+import toolkit_main as tkm
+import toolkit_3D as tk3
+from contact3D import calculate_3D_contact
+from contact2D import calculate_2D_contact
+
+# Make tk3.get_nii tolerant to a 'rotate' keyword if the underlying function doesn't accept it.
+# This avoids TypeError in places that call tk3.get_nii(..., rotate=True)
+st.set_page_config(
+    page_title="胰腺肿瘤可切除性分析",
+    layout="wide",
+    page_icon="🩺",
+    initial_sidebar_state="expanded"
+)
+
+
+def display_detailed_results(results):
+    st.markdown("### 📊 详细分析结果")
+
+    # 1. 显示 2D 分析结果
+    if "2D" in results:
+        st.markdown("#### 2D 接触分析")
+        for target, data in results["2D"].items():
+            if "error" in data:
+                st.error(f"{target.capitalize()} 2D 分析失败: {data['error']}")
+            else:
+                st.write(f"- **{target.capitalize()}**")
+                st.write(f"  - 最大接触比例: {data.get('max_ratio', 'N/A'):.2f}")
+                st.write(f"  - 最大接触切片索引: {data.get('max_slice', 'N/A')}")
+
+    # 2. 显示 3D 分析结果
+    if "3D" in results:
+        st.markdown("#### 3D 接触分析")
+        for target, data in results["3D"].items():
+            if "error" in data:
+                st.error(f"{target.capitalize()} 3D 分析失败: {data['error']}")
+            elif isinstance(data, list) and len(data) > 0:  # 检查是否为非空列表
+                st.write(f"- **{target.capitalize()}**")
+                st.write(f"  - 接触比例: {data[0].get('contact_ratio', 'N/A'):.2f}")
+                st.write(f"  - 接触体积: {data[0].get('contact_volume', 'N/A')}")
+            else:
+                st.warning(f"{target.capitalize()} 3D 分析结果为空或格式无效")
+
+    # 3. 显示骨架分析结果
+    if "skeleton" in results:
+        st.markdown("#### 骨架分析")
+        for target, data in results["skeleton"].items():
+            if "error" in data:
+                st.error(f"{target.capitalize()} 骨架分析失败: {data['error']}")
+            else:
+                st.write(f"- **{target.capitalize()}**")
+                st.write(f"  - 骨架长度: {data.get('length', 'N/A'):.2f}")
+                st.write(f"  - 分支数量: {data.get('branches', 'N/A')}")
+
+    # 4. 可视化结果（替换为热力图）
+    if "3D" in results and isinstance(results["3D"], dict):
+        st.markdown("#### 可视化结果")
+        # 检查数据是否有效
+        artery_data = results["3D"].get("artery", [])
+        vein_data = results["3D"].get("vein", [])
+        if len(artery_data) > 0 and len(vein_data) > 0:
+            # 用热力图展示接触比例
+            import plotly.express as px
+            import pandas as pd
+
+            data = {
+                "血管类型": ["动脉", "静脉"],
+                "接触比例": [
+                    artery_data[0].get("contact_ratio", 0),
+                    vein_data[0].get("contact_ratio", 0)
+                ]
+            }
+            df = pd.DataFrame(data)
+
+            fig = px.imshow(
+                df.pivot_table(values="接触比例", index=None, columns="血管类型"),
+                labels=dict(x="血管类型", y="", color="接触比例"),
+                color_continuous_scale="Viridis",
+                title="3D 接触比例热力图"
+            )
+            fig.update_layout(width=500, height=300)
+            st.plotly_chart(fig)
+        else:
+            st.warning("3D 分析数据不足，无法生成可视化图表")
+
+
+
+
+
+def display_score_card(score, label):
+    st.markdown("### 切除性评估")
+    score_color = "#FF4B4B" if score < 0.4 else ("#FFA500" if score < 0.7 else "#2ECC71")
+    st.markdown(f"""
+    <div style="border-left: 5px solid {score_color}; padding: 10px; background: #F8F9FA;">
+        <p style="font-size: 16px; margin: 0;">评分: <span style="font-weight: bold; color: {score_color}; font-size: 24px;">{score:.2f}</span></p>
+        <p style="font-size: 14px; margin: 0;">结论: {label}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+try:
+    _orig_get_nii = tk3.get_nii
+
+
+    def _get_nii_compat(path, *args, **kwargs):
+        if 'rotate' in kwargs:
+            try:
+                return _orig_get_nii(path, *args, **kwargs)
+            except TypeError:
+                # underlying implementation doesn't accept 'rotate'
+                kwargs.pop('rotate')
+                return _orig_get_nii(path, *args, **kwargs)
+        else:
+            return _orig_get_nii(path, *args, **kwargs)
+
+
+    tk3.get_nii = _get_nii_compat
+except Exception:
+    # If monkeypatching fails for some reason, continue — safe_get_nii also handles compatibility.
+    pass
+
+# skeleton analysis may fail if kimimaro/cloud-volume incompatible
+try:
+    from SkeletonAnalysis import skeleton_analysis
+
+    SKELETON_AVAILABLE = True
+except Exception:
+    SKELETON_AVAILABLE = False
+
+# 标题与上传
+st.title("🩺 胰腺肿瘤可切除性分析")
+uploaded = st.file_uploader("📤 上传分割文件 (.nii)", type=["nii", "nii.gz"])
+#
+# st.markdown("上传分割好的 NIfTI (.nii 或 .nii.gz)，标签为：1=动脉，2=肿瘤，3=静脉。")
+#
+# uploaded = st.file_uploader("上传分割 NIfTI", type=["nii", "nii.gz"])
+
+with st.sidebar:
+    with st.expander("⚙️ 参数设置", expanded=True):
+        contour_thickness = st.slider("轮廓厚度", 0.5, 5.0, 1.5)
+        contact_range = st.slider("接触范围（体素）", 0, 10, 2)
+        axis = st.selectbox("切片查看轴", ["z", "x"], index=0)
+        do_2d = st.checkbox("运行 2D 接触分析", value=True)
+    with st.expander("🔍 高级选项"):
+        do_3d = st.checkbox("运行 3D 接触分析", value=True)
+        do_skeleton = st.checkbox("运行骨架分析", value=True)
+    if do_skeleton and not SKELETON_AVAILABLE:
+        st.warning("无法导入 SkeletonAnalysis，在此环境中骨架分析将被跳过。")
+        do_skeleton = False
+
+
+def save_uploaded(tmpdir, uploaded_file):
+    dest = os.path.join(tmpdir, uploaded_file.name)
+    with open(dest, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return dest
+
+
+def load_normalized_nii(path):
+    """
+    Load a NIfTI and return a 3D numpy array with shape (H, W, Z) (label volume).
+    Handles:
+      - channel-first one-hot e.g. (C, H, W) or (C, H, W, T) -> move channel to last, argmax
+      - channel-last one-hot e.g. (H, W, C) -> argmax
+      - 2D arrays -> expand to (H, W, 1)
+      - already (H, W, Z) -> pass-through
+    """
+    img = nib.load(path)
+    data = np.asarray(img.get_fdata())
+    # 4D where first dim is small -> treat as channel-first
+    if data.ndim == 4 and data.shape[0] <= 8:
+        data = np.moveaxis(data, 0, -1)
+    # 3D but one axis is small (<=8) and others large -> likely channel-first
+    if data.ndim == 3:
+        small_axes = [i for i, s in enumerate(data.shape) if s <= 8]
+        if small_axes and max(data.shape) > 20:
+            ch = small_axes[0]
+            if ch != (data.ndim - 1):
+                data = np.moveaxis(data, ch, -1)
+    # If last axis looks like channels (<=8), convert one-hot/multi-channel to labels
+    if data.ndim == 3 and data.shape[-1] <= 8:
+        try:
+            data = np.argmax(data, axis=-1)
+        except Exception:
+            data = np.squeeze(data)
+    # If 2D -> expand to single-slice 3D
+    if data.ndim == 2:
+        data = data[..., np.newaxis]
+    # final check/reshape
+    data = np.asarray(data)
+    if data.ndim == 3:
+        return data
+    data = np.squeeze(data)
+    if data.ndim == 2:
+        return data[..., np.newaxis]
+    raise ValueError(f"Unsupported nifti shape after normalization: {data.shape}")
+
+
+def display_slice_from_nii(nii_path, axis='z', slice_index=None, title=None):
+    img = load_normalized_nii(nii_path)
+    # rotate/assume orientation similar to toolkit_3D.get_nii
+    if axis == 'z':
+        depth = img.shape[2]
+        if slice_index is None:
+            slice_index = depth // 2
+        slice_img = img[:, :, slice_index]
+    else:
+        depth = img.shape[0]
+        if slice_index is None:
+            slice_index = depth // 2
+        slice_img = img[slice_index, :, :]
+    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+    ax.imshow(slice_img.T, cmap='gray', origin='lower')
+    if title:
+        ax.set_title(title, fontsize=10)
+    ax.axis('off')
+    return fig
+
+
+def make_overlay_fig(origin_nii, contact_nii, axis='z', slice_index=None):
+    oimg = load_normalized_nii(origin_nii)
+    cimg = load_normalized_nii(contact_nii)
+    if axis == 'z':
+        if slice_index is None:
+            slice_index = oimg.shape[2] // 2
+        o = oimg[:, :, slice_index]
+        c = cimg[:, :, slice_index]
+    else:
+        if slice_index is None:
+            slice_index = oimg.shape[0] // 2
+        o = oimg[slice_index, :, :]
+        c = cimg[slice_index, :, :]
+
+    # origin: show tumor in red, artery/vein contours and contacts with colors
+    # Correctly create a transposed base image for display
+    base = np.zeros((o.shape[1], o.shape[0], 3), dtype=np.float32)
+
+    # Transpose masks before assigning to channels
+    tumor_mask = (o == 2).T
+    artery_contour = ((c == 2) | (c == 4)).T
+    artery_contact = ((c == 3) | (c == 5)).T
+    vein_contour = (c == 2).T  # fallback
+    vein_contact = (c == 3).T
+
+    base[..., 0] = tumor_mask.astype(float) * 0.8
+    base[..., 1] = artery_contour.astype(float) * 0.6 + vein_contact.astype(float) * 0.4
+    base[..., 2] = artery_contact.astype(float) * 0.8 + vein_contour.astype(float) * 0.3
+
+    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+    # Display the base image without incorrect transposition
+    ax.imshow(base, origin='lower')
+    ax.axis('off')
+    return fig
+
+
+def make_contact_only_fig(contact_nii, axis='z', slice_index=None, title=None):
+    """
+    Show the contact NIfTI slice in color-coded way:
+      - background -> black
+      - contour voxels -> yellow
+      - contact voxels -> red
+    This helps visualize where contacts are detected.
+    """
+    cimg = load_normalized_nii(contact_nii)
+    if axis == 'z':
+        if slice_index is None:
+            slice_index = cimg.shape[2] // 2
+        c = cimg[:, :, slice_index]
+    else:
+        if slice_index is None:
+            slice_index = cimg.shape[0] // 2
+        c = cimg[slice_index, :, :]
+
+    # build rgb
+    rgb = np.zeros((c.shape[1], c.shape[0], 3), dtype=np.float32)
+    # Define simple masks (transpose for correct orientation)
+    contour_mask = ((c == 2) | (c == 4)).T
+    contact_mask = ((c == 3) | (c == 5)).T
+    artery_mask = (c == 2).T
+    vein_mask = (c == 3).T
+
+    rgb[..., 0] = contact_mask.astype(float)  # red channel for contact
+    rgb[..., 1] = contour_mask.astype(float) * 0.7  # green-ish for contour
+    rgb[..., 2] = 0.0
+    if title is None:
+        title = "Contact Slice"
+
+    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+    ax.imshow(rgb, origin='lower')
+    ax.set_title(title, fontsize=10)
+    ax.axis('off')
+    return fig
+
+
+def safe_get_nii(path, rotate=True):
+    """Call tk3.get_nii in a backward-compatible way: try keyword 'rotate' first,
+    fall back to calling without keyword if function signature doesn't accept it.
+    """
+    try:
+        return tk3.get_nii(path, rotate=rotate)
+    except TypeError:
+        # fallback to positional call if rotate kw not supported
+        return tk3.get_nii(path)
+
+
+def display_input_and_contact(origin_path, contact_path, axis='z', slice_index=None):
+    """
+    Display three images side-by-side:
+      - Original segmentation slice (grayscale labels)
+      - Contact-only visualization (colored)
+      - Overlay (tumor + contacts)
+    """
+    cols = st.columns(3)
+    # Original
+    with cols[0]:
+        try:
+            fig_o = display_slice_from_nii(origin_path, axis=axis, slice_index=slice_index, title="原始分割切片")
+            st.pyplot(fig_o)
+        except Exception as e:
+            st.error(f"无法展示原始切片: {e}")
+    # Contact-only
+    with cols[1]:
+        try:
+            fig_c = make_contact_only_fig(contact_path, axis=axis, slice_index=slice_index, title="接触掩码切片")
+            st.pyplot(fig_c)
+        except Exception as e:
+            st.error(f"无法展示接触切片: {e}")
+    # Overlay
+    with cols[2]:
+        try:
+            fig_overlay = make_overlay_fig(origin_path, contact_path, axis=axis, slice_index=slice_index)
+            st.pyplot(fig_overlay)
+        except Exception as e:
+            st.error(f"无法展示叠加视图: {e}")
+
+
+if uploaded is not None:
+    tmpdir = tempfile.mkdtemp(prefix="pancreas_demo_")
+    try:
+        saved = save_uploaded(tmpdir, uploaded)
+        st.success(f"已将上传文件保存到 {saved}")
+
+        file_dict = {
+            "img_id": os.path.splitext(os.path.basename(saved))[0],
+            "img_path": saved,
+            "img_contact_path": None
+        }
+        contact_dir = tmpdir
+
+        # --- Progress Bar Setup ---
+        total_steps = 1 + do_2d + do_3d + do_skeleton  # 1 for contact generation
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        current_step = 0
+
+
+        def update_progress(step_name):
+            global current_step
+            current_step += 1
+            progress = current_step / total_steps
+            progress_bar.progress(progress)
+            status_text.text(f"步骤 {current_step}/{total_steps}: {step_name}")
+
+
+        # --- Step 1: Generate Contact Image ---
+        update_progress("正在生成接触面图像...")
+        with st.spinner("生成接触面中..."):
+            try:
+                tkm.generate_contour_nii_3D(file_dict, contact_dir, prefix="contact_",
+                                            contour_thickness=contour_thickness,
+                                            contact_range=contact_range, axis=axis)
+            except Exception as e:
+                st.error("生成接触面失败: " + str(e))
+                st.text(traceback.format_exc())
+                st.stop()  # Stop execution if this critical step fails
+
+        st.write("接触 NIfTI:", file_dict.get("img_contact_path"))
+
+        results = {"2D": {}, "3D": {}, "skeleton": {}}
+
+        # --- Step 2: 2D Analysis ---
+        if do_2d:
+            update_progress("正在执行 2D 接触分析...")
+            with st.spinner("⏳ 2D 分析中..."):
+                progress_bar = st.progress(0)
+                for i in range(100):
+                    time.sleep(0.05)
+                    progress_bar.progress(i + 1)
+                for target in ["vein", "artery"]:
+                    try:
+                        slice_list, max_ratio, max_slice = tkm.calculate_2D_contact(file_dict, target,
+                                                                                    contact_dir=contact_dir,
+                                                                                    size_threshold=30, axis=axis)
+                        results["2D"][target] = {"slices": slice_list, "max_ratio": float(max_ratio),
+                                                 "max_slice": int(max_slice)}
+                    except Exception as e:
+                        results["2D"][target] = {"error": str(e)}
+                        st.error(f"2D 分析失败（{target}）：{e}")
+
+        # --- Step 3: 3D Analysis ---
+        if do_3d:
+            update_progress("正在执行 3D 接触分析...")
+            with st.spinner("⏳ 3D 分析中..."):
+                progress_bar = st.progress(0)
+                for i in range(100):
+                    time.sleep(0.05)
+                    progress_bar.progress(i + 1)
+                for target in ["vein", "artery"]:
+                    try:
+                        res3 = calculate_3D_contact(file_dict, target)
+                        results["3D"][target] = res3
+                    except Exception as e:
+                        results["3D"][target] = {"error": str(e)}
+                        st.error(f"3D 分析失败（{target}）：{e}")
+
+        # --- Step 4: Skeleton Analysis ---
+        if do_skeleton:
+            update_progress("正在执行骨架分析...")
+            with st.spinner("⏳ 骨架化中..."):
+                progress_bar = st.progress(0)
+                for i in range(100):
+                    time.sleep(0.05)
+                    progress_bar.progress(i + 1)
+                for target in ["vein", "artery"]:
+                    try:
+                        skeleton_res = skeleton_analysis(file_dict, target, print_info=False)
+                        results["skeleton"][target] = skeleton_res
+                    except Exception as e:
+                        results["skeleton"][target] = {"error": str(e)}
+                        st.error(f"骨架分析失败（{target}）：{e}")
+
+        status_text.text("✅所有分析步骤已完成！")
+        progress_bar.progress(1.0)
+
+        # --- Post-processing and Results ---
+        # tumor info
+        try:
+            origin_struct = None
+            try:
+                origin_struct = safe_get_nii(file_dict["img_path"], rotate=True)
+            except Exception:
+                origin_struct = None
+            if isinstance(origin_struct, dict) and "tumor" in origin_struct:
+                tumor_mask = origin_struct["tumor"]
+                tumor_volume = int(np.sum(np.asarray(tumor_mask) > 0))
+            else:
+                lbl = load_normalized_nii(file_dict["img_path"])
+                tumor_volume = int(np.sum(lbl == 2))
+        except Exception:
+            tumor_volume = None
+
+        # simple resectability scoring rule (example)
+        score = 0.5
+        if "artery" in results["3D"] and isinstance(results["3D"]["artery"], list) and len(results["3D"]["artery"]) > 0:
+            c3a = results["3D"]["artery"][0].get("contact_ratio", 0)
+            score -= 0.3 * c3a
+        if "vein" in results["3D"] and isinstance(results["3D"]["vein"], list) and len(results["3D"]["vein"]) > 0:
+            c3v = results["3D"]["vein"][0].get("contact_ratio", 0)
+            score -= 0.15 * c3v
+        if tumor_volume is not None:
+            score -= 0.05 * np.log1p(tumor_volume)
+        score = float(max(0.0, min(1.0, score)))
+
+        if score > 0.7:
+            label = "可能可切除"
+        elif score > 0.4:
+            label = "边界性"
+        else:
+            label = "可能不可切除"
+
+        st.header("结果摘要")
+        st.write("切除性评分：", score, "（", label, "）")
+
+        # 显示结果
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            display_score_card(score, label)
+        with col2:
+            with st.expander("📊 详细分析结果", expanded=True):
+                display_detailed_results(results)
+#        st.json(results)
+
+        # --- Visualization (with corrected indentation) ---
+        st.header("可视化")
+        if file_dict.get("img_contact_path") and os.path.exists(file_dict["img_contact_path"]):
+            oimg = load_normalized_nii(file_dict["img_path"])
+            if axis == 'z':
+                max_slice = oimg.shape[2] - 1
+                default_slice = oimg.shape[2] // 2
+            else:  # axis == 'x'
+                max_slice = oimg.shape[0] - 1
+                default_slice = oimg.shape[0] // 2
+
+            # Ensure the slider's default value doesn't exceed the max slice index
+            slice_index = st.slider(
+                "选择切片索引",
+                min_value=0,
+                max_value=max_slice,
+                value=min(default_slice, max_slice)
+            )
+
+            # New: display original slice, contact-only slice, and overlay side-by-side
+            display_input_and_contact(file_dict["img_path"], file_dict["img_contact_path"], axis=axis,
+                                      slice_index=slice_index)
+        else:
+            st.info("未生成用于可视化的接触 NIfTI。")
+
+    finally:
+        if st.checkbox("现在清理临时文件", value=False):
+            try:
+                shutil.rmtree(tmpdir)
+                st.success("临时文件已删除")
+            except Exception as e:
+                st.error("删除临时目录失败: " + str(e))
+
+else:
+    st.info("请上传分割好的 NIfTI 以开始分析。")
+
+# 可视化分栏（页面底部也显示一次，方便快速查看）
+if uploaded:
+    # Protect against missing variables when user hasn't finished processing
+    try:
+        if file_dict.get("img_contact_path") and os.path.exists(file_dict["img_contact_path"]):
+            oimg = load_normalized_nii(file_dict["img_path"])
+            if axis == 'z':
+                max_slice = oimg.shape[2] - 1
+                default_slice = oimg.shape[2] // 2
+            else:
+                max_slice = oimg.shape[0] - 1
+                default_slice = oimg.shape[0] // 2
+
+            # keep previous chosen slice if exists, else default
+            try:
+                current_slice = slice_index
+            except NameError:
+                current_slice = min(default_slice, max_slice)
+
+            st.markdown("---")
+            st.subheader("切片快速预览")
+            display_input_and_contact(file_dict["img_path"], file_dict["img_contact_path"], axis=axis,
+                                      slice_index=current_slice)
+
+            st.markdown("### 评分卡")
+            st.metric("切除性评分", f"{score:.2f}", label)
+    except Exception:
+        # If anything not available yet, silently ignore (already shown above)
+        pass
+
+# 主页面分栏
+# if uploaded:
+#     col1, col2 = st.columns(2)
+#     with col1:
+#         st.pyplot(make_overlay_fig(...))
+#     with col2:
+#         if do_skeleton:
+#             st.pyplot(make_skeleton_fig(...))
+#
+#     # 结果下载
+#     st.download_button("Download Results", json.dumps(results), file_name="results.json")
+
+# if file_dict.get("img_contact_path"):
+#     col1, col2 = st.columns(2)
+#     with col1:
+#         st.pyplot(fig)  # 图像显示在左栏
+#     with col2:
+#         st.json(results)  # 分析结果在右栏
